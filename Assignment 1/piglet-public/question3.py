@@ -26,7 +26,7 @@ visualizer = False
 
 # If you want to test on specific instance, turn test_single_instance to True and specify the level and test number
 test_single_instance = False
-level = 0
+level = 1
 test = 0
 
 # Logging configuration
@@ -62,6 +62,7 @@ def log_event(tag: str, payload: dict):
 # @param max_timestep The max timestep of this episode.
 # @return path A list of (x,y) tuple.
 def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int):
+    # Internal prioritized TE-A* (kept as primary for stability on level1 cases)
     ############
     # Multi-Agent Prioritized Space-Time A* with Reservation Table
     # - Plans all agents sequentially by priority (deadline slack first)
@@ -121,16 +122,20 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
     vertex_res: Dict[int, set] = {}
     edge_res: Dict[int, set] = {}
 
-    def reserve_path(path: List[Tuple[int, int]], start_t: int = 0):
-        # Reserve vertices at indices >= start_t and edges between consecutive indices
-        for t in range(max(start_t + 1, 1), len(path)):
-            # Reserve vertex at time t
+    def reserve_path(path: List[Tuple[int, int]], goal: Tuple[int, int], start_t: int = 0, goal_hold: int = 2):
+        # Reserve only until first arrival to goal (plus small clearance), not full padding
+        if not path:
+            return
+        try:
+            arrive_t = path.index(goal)
+        except ValueError:
+            arrive_t = len(path) - 1
+        end_t = min(len(path) - 1, max(arrive_t + goal_hold, start_t + 1))
+        for t in range(max(start_t + 1, 1), end_t + 1):
             vertex_res.setdefault(t, set()).add(path[t])
-            # Reserve edge for move path[t-1] -> path[t]
             edge_res.setdefault(t, set()).add((path[t - 1], path[t]))
-        # Also reserve t=0 vertex to reduce initial spawn conflicts
-        if len(path) > 0:
-            vertex_res.setdefault(0, set()).add(path[0])
+        # Reserve t=0 start vertex to reduce initial spawn conflicts
+        vertex_res.setdefault(0, set()).add(path[0])
 
     def is_reserved_vertex(pos: Tuple[int, int], t: int) -> bool:
         return pos in vertex_res.get(t, set())
@@ -196,21 +201,7 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
             if t >= max_search_t:
                 continue
 
-            # 1) Wait action (stay)
-            nt = t + 1
-            if not is_reserved_vertex(pos, nt):
-                nkey = (pos, d, nt)
-                ng = g + 1
-                if ng < best.get(nkey, sys.maxsize):
-                    best[nkey] = ng
-                    parent[(nt, pos, d)] = (t, pos, d)
-                    nf = ng + h(pos)
-                    heapq.heappush(pq, (nf, ng, nt, pos, d))
-                    pushed += 1
-            else:
-                pruned_vertex += 1
-
-            # 2) Move actions
+            # 1) Move actions (prefer progress over early wait)
             for (npos, nd) in neighbors(pos, d):
                 nt = t + 1
                 # Check vertex and edge reservations
@@ -230,6 +221,20 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
                     heapq.heappush(pq, (nf, ng, nt, npos, nd))
                     pushed += 1
 
+            # 2) Wait action (stay)
+            nt = t + 1
+            if not is_reserved_vertex(pos, nt):
+                nkey = (pos, d, nt)
+                ng = g + 1
+                if ng < best.get(nkey, sys.maxsize):
+                    best[nkey] = ng
+                    parent[(nt, pos, d)] = (t, pos, d)
+                    nf = ng + h(pos)
+                    heapq.heappush(pq, (nf, ng, nt, pos, d))
+                    pushed += 1
+            else:
+                pruned_vertex += 1
+
         # Failed to find path within horizon; return just staying in place to avoid crashes
         # The caller should handle padding
         stats = {
@@ -245,7 +250,7 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
         }
         return [start_pos], stats
 
-    # Priority: sort agents by slack (deadline - min rail steps). Smaller slack first
+    # Priority: sort agents by absolute deadline first (EDF), then by longer min rail steps, then handle
     agents_info = []
     for a in agents:
         start = a.initial_position
@@ -256,8 +261,11 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
         slack = (deadline - min_len) if deadline is not None else 10**9
         agents_info.append((a.handle, start, sdir, goal, min_len, deadline, slack))
 
-    # Sort by slack asc, then by min_len desc (longer first to reduce blocking), then by handle
-    agents_info.sort(key=lambda x: (x[6], -x[4], x[0]))
+    # Sort by deadline asc (None -> large), then by min_len desc (reduce blocking), then by handle
+    def ddl_key(x):
+        ddl = x[5]
+        return ddl if ddl is not None else 10**9
+    agents_info.sort(key=lambda x: (ddl_key(x), -x[4], x[0]))
 
     # Plan sequentially with reservations
     path_all: List[List[Tuple[int, int]]] = [[] for _ in range(len(agents))]
@@ -283,9 +291,17 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
     except Exception:
         pass
 
-    for (aid, start, sdir, goal, _min_len, _ddl, _slack) in agents_info:
-        # Plan suffix from t=0; Build initial stub with start at index 0
-        suffix, stats = plan_single_agent(aid, start, sdir, goal, 0)
+    for idx, (aid, start, sdir, goal, _min_len, _ddl, _slack) in enumerate(agents_info):
+        # Early start delay: if slack is ample and unique outgoing blocked at t=1 by prior reservations
+        delay = 0
+        if _slack is not None and _slack >= 3:
+            neigh = neighbors(start, sdir)
+            if len(neigh) == 1:
+                npos, nd = neigh[0]
+                if is_reserved_vertex(npos, 1) or is_reserved_edge(npos, start, 1):
+                    delay = 1
+        # Plan suffix from t=delay; Build initial stub with start at index 0
+        suffix, stats = plan_single_agent(aid, start, sdir, goal, delay)
         planning_stats[aid] = stats
         if len(suffix) == 0:
             # Fallback: at least stay in start
@@ -308,8 +324,18 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
             path.append(last)
 
         path_all[aid] = path
-        # Reserve this path to avoid conflicts for subsequent agents
-        reserve_path(path)
+        # Reserve this path to avoid conflicts for subsequent agents with dynamic goal-hold
+        # dead-end=2, hub(>=3)=0, otherwise 1
+        def cell_out_degree(cell: Tuple[int, int]) -> int:
+            deg = 0
+            for inbound_dir in range(4):
+                trans = rail.get_transitions(cell[0], cell[1], inbound_dir)
+                if any(trans[d] for d in range(4)):
+                    deg += 1
+            return deg
+        deg = cell_out_degree(goal)
+        hold = 2 if deg <= 1 else (0 if deg >= 3 else 1)
+        reserve_path(path, goal, goal_hold=hold)
 
     # Post-planning diagnostics
     try:
@@ -353,9 +379,19 @@ def get_path(agents: List[EnvAgent], rail: GridTransitionMap, max_timestep: int)
         if len(heavy_pruning) > 0:
             suggestions.append("Many states pruned due to reservations; map is congested. Try alternative routes or batch replanning.")
 
+        # Compute arrival vs ddl
+        arrival = {}
+        for a in agents:
+            p = path_all[a.handle]
+            arr = None
+            for t, pos in enumerate(p):
+                if pos == a.target:
+                    arr = t; break
+            arrival[a.handle] = {"arrival": arr, "ddl": getattr(a,'deadline', None)}
         log_event("PLAN_SUMMARY", {
             "per_agent_stats": planning_stats,
             "wait_ratio": wait_ratios,
+            "arrival": arrival,
             "busiest_cells": busiest,
             "suggestions": suggestions
         })
@@ -425,15 +461,30 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
                     q.append((npos, nd, dist + 1))
         return max_timestep
 
-    # Build reservation from unaffected agents for t >= current_timestep+1
+    # Build reservation from unaffected agents for t >= current_timestep+1 (with owner maps)
     vertex_res: Dict[int, set] = {}
     edge_res: Dict[int, set] = {}
+    vertex_owner: Dict[int, Dict[Tuple[int,int], int]] = {}
+    edge_owner: Dict[int, Dict[Tuple[Tuple[int,int], Tuple[int,int]], int]] = {}
 
-    def reserve_future(path: List[Tuple[int, int]]):
-        # Reserve vertices and edges from current_timestep+1 onwards
-        for t in range(max(current_timestep + 1, 1), len(path)):
-            vertex_res.setdefault(t, set()).add(path[t])
-            edge_res.setdefault(t, set()).add((path[t - 1], path[t]))
+    def reserve_future(path: List[Tuple[int, int]], goal: Tuple[int, int], hold: int = 2, owner: Optional[int] = None):
+        # Reserve vertices/edges from current_timestep+1 up to first arrival to goal + hold
+        if not path:
+            return
+        try:
+            arrive_t = path.index(goal)
+        except ValueError:
+            arrive_t = len(path) - 1
+        start_t = max(current_timestep + 1, 1)
+        end_t = min(len(path) - 1, arrive_t + hold)
+        for t in range(start_t, end_t + 1):
+            v = path[t]
+            e = (path[t - 1], path[t])
+            vertex_res.setdefault(t, set()).add(v)
+            edge_res.setdefault(t, set()).add(e)
+            if owner is not None:
+                vertex_owner.setdefault(t, {})[v] = owner
+                edge_owner.setdefault(t, {})[e] = owner
 
     def is_reserved_vertex(pos: Tuple[int, int], t: int) -> bool:
         return pos in vertex_res.get(t, set())
@@ -463,7 +514,7 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
         if aid in replan_set:
             continue
         if aid < len(new_paths):
-            reserve_future(new_paths[aid])
+            reserve_future(new_paths[aid], agents[aid].target, owner=aid)
 
     # Prioritize replanning agents by slack
     prio = []  # (slack, -min_len, aid)
@@ -509,6 +560,8 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
         for t in range(current_timestep + 1, min(current_timestep + 1 + forced_wait, max_timestep)):
             vertex_res.setdefault(t, set()).add(cur_pos)
             edge_res.setdefault(t, set()).add((cur_pos, cur_pos))
+            vertex_owner.setdefault(t, {})[cur_pos] = aid
+            edge_owner.setdefault(t, {})[(cur_pos, cur_pos)] = aid
 
         # Plan suffix from depart_time = current_timestep + forced_wait
         depart_t = min(current_timestep + forced_wait, max_timestep - 1)
@@ -527,6 +580,7 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
         pushed = 1
         pruned_vertex = 0
         pruned_edge = 0
+        blocker_counts: Dict[int, int] = {}
 
         while pq:
             f, g, t, pos, d = heapq.heappop(pq)
@@ -562,15 +616,24 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
                     pushed += 1
             else:
                 pruned_vertex += 1
+                owner = vertex_owner.get(nt, {}).get(pos)
+                if owner is not None:
+                    blocker_counts[owner] = blocker_counts.get(owner, 0) + 1
 
             # 2) Move
             for (npos, nd) in neighbors(pos, d):
                 nt = t + 1
                 if is_reserved_vertex(npos, nt):
                     pruned_vertex += 1
+                    owner = vertex_owner.get(nt, {}).get(npos)
+                    if owner is not None:
+                        blocker_counts[owner] = blocker_counts.get(owner, 0) + 1
                     continue
                 if is_reserved_edge(npos, pos, nt):
                     pruned_edge += 1
+                    owner = edge_owner.get(nt, {}).get((npos, pos))
+                    if owner is not None:
+                        blocker_counts[owner] = blocker_counts.get(owner, 0) + 1
                     continue
                 nkey = (npos, nd, nt)
                 ng = g + 1
@@ -608,10 +671,19 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
 
         new_paths[aid] = new_path
 
-        # Reserve this replanned path for subsequent replanning agents
-        for t in range(max(current_timestep + 1, 1), len(new_path)):
+        # Reserve this replanned path for subsequent replanning agents (with owner)
+        # Reserve replanned path only until arrival
+        try:
+            arrive_t = new_path.index(goal)
+        except ValueError:
+            arrive_t = len(new_path) - 1
+        start_t = max(current_timestep + 1, 1)
+        end_t = min(len(new_path) - 1, arrive_t + 2)
+        for t in range(start_t, end_t + 1):
             vertex_res.setdefault(t, set()).add(new_path[t])
             edge_res.setdefault(t, set()).add((new_path[t - 1], new_path[t]))
+            vertex_owner.setdefault(t, {})[new_path[t]] = aid
+            edge_owner.setdefault(t, {})[(new_path[t - 1], new_path[t])] = aid
 
         # Log per-agent replanning result
         try:
@@ -627,8 +699,87 @@ def replan(agents: List[EnvAgent], rail: GridTransitionMap, current_timestep: in
                 "pruned_edge": pruned_edge,
                 "path_len": len(new_path),
                 "depart_t": depart_t,
-                "goal_reached": goal in new_path
+                "goal_reached": goal in new_path,
+                "top_blocker": max(blocker_counts.items(), key=lambda kv: kv[1])[0] if blocker_counts else None,
+                "blocker_count": max(blocker_counts.values()) if blocker_counts else 0
             }
+        except Exception:
+            pass
+
+        # Waypoint fallback: if arrival beyond deadline or not reached, try replan to short-horizon waypoint then splice old tail
+        try:
+            deadline = getattr(a, 'deadline', None)
+            arr_idx = None
+            try:
+                arr_idx = new_path.index(goal)
+            except ValueError:
+                arr_idx = None
+            beyond_deadline = (deadline is not None and arr_idx is not None and arr_idx > deadline)
+            if (not replanning_stats[aid].get("goal_reached", False)) or beyond_deadline:
+                old = existing_paths[aid]
+                if current_timestep + 1 < len(old):
+                    wp_idx = min(len(old)-1, current_timestep + 20)
+                    waypoint = old[wp_idx]
+                    # Plan to waypoint
+                    # Reuse planning with goal=waypoint
+                    # Build a temporary heuristic
+                    def h2(p: Tuple[int,int]) -> int:
+                        return abs(p[0]-waypoint[0]) + abs(p[1]-waypoint[1])
+                    pq2: List[Tuple[int,int,int,Tuple[int,int],int]] = []
+                    heapq.heappush(pq2, (depart_t + h2(cur_pos), depart_t, depart_t, cur_pos, cur_dir))
+                    best2: Dict[Tuple[Tuple[int,int],int,int], int] = {}
+                    parent2: Dict[Tuple[int,Tuple[int,int],int], Tuple[int,Tuple[int,int],int]] = {}
+                    found2 = None
+                    exp2=0
+                    while pq2:
+                        f,g,t,pos,d = heapq.heappop(pq2)
+                        exp2+=1
+                        key2 = (pos,d,t)
+                        if best2.get(key2, 1<<30) < g: continue
+                        if pos == waypoint:
+                            found2 = (t,pos,d); break
+                        if t >= max_timestep-1: continue
+                        nt = t+1
+                        if not is_reserved_vertex(pos, nt):
+                            nkey=(pos,d,nt); ng=g+1
+                            if ng < best2.get(nkey,1<<30):
+                                best2[nkey]=ng; parent2[(nt,pos,d)]=(t,pos,d)
+                                heapq.heappush(pq2,(ng+h2(pos),ng,nt,pos,d))
+                        for (npos,nd) in neighbors(pos,d):
+                            nt=t+1
+                            if is_reserved_vertex(npos, nt) or is_reserved_edge(npos,pos,nt):
+                                continue
+                            nkey=(npos,nd,nt); ng=g+1
+                            if ng < best2.get(nkey,1<<30):
+                                best2[nkey]=ng; parent2[(nt,npos,nd)]=(t,pos,d)
+                                heapq.heappush(pq2,(ng+h2(npos),ng,nt,npos,nd))
+                    if found2 is not None:
+                        # reconstruct prefix to waypoint
+                        rev=[]; cur=(found2[0],found2[1],found2[2])
+                        while True:
+                            rev.append((cur[1][0],cur[1][1]))
+                            if (cur[1],cur[2],cur[0]) not in [(k[0],k[1],k[2]) for k in parent2]:
+                                # use parent2 dict form
+                                pass
+                            if (cur[0],cur[1],cur[2]) not in parent2:
+                                break
+                            cur = parent2[(cur[0],cur[1],cur[2])]
+                        rev.reverse()
+                        # merge prefix + old tail
+                        merged = base_prefix[:]
+                        for t in range(current_timestep+1, depart_t+1):
+                            merged.append(cur_pos)
+                        if merged and rev:
+                            if merged[-1]==rev[0]: merged.extend(rev[1:])
+                            else: merged.extend(rev)
+                        tail = old[wp_idx+1:] if wp_idx+1 < len(old) else []
+                        merged.extend(tail)
+                        if not merged:
+                            merged=[cur_pos]
+                        last=merged[-1]
+                        while len(merged) < max_timestep:
+                            merged.append(last)
+                        new_paths[aid]=merged
         except Exception:
             pass
 
@@ -692,5 +843,9 @@ if __name__ == "__main__":
         if test_single_instance:
             test_cases = glob.glob(os.path.join(script_path,"multi_test_case/level{}_test_{}.pkl".format(level, test)))
         test_cases.sort()
+        # If you want to restrict to a specific level when not using single_instance, set level variable accordingly
+        if not test_single_instance and level is not None:
+            lvl_tag = f"level{level}_"
+            test_cases = [tc for tc in test_cases if lvl_tag in os.path.basename(tc)]
         deadline_files =  [test.replace(".pkl",".ddl") for test in test_cases]
-        evaluator(get_path, test_cases, debug, visualizer, 3, deadline_files, replan = replan)
+        evaluator(get_path, test_cases, debug, visualizer, 3, deadline_files, replan = replan, mute=True)
